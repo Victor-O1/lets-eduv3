@@ -5,7 +5,7 @@ const STROKE = 10;
 const CIRCUMFERENCE = 2 * Math.PI * RADIUS;
 
 // visual choice: one full revolution = 60 minutes
-const SECONDS_PER_LAP = 60 * 60;
+const SECONDS_PER_LAP = 60 * 60 * 2;
 
 export default function TimerCircle({ elapsed }: { elapsed: number }) {
   const progress = (elapsed % SECONDS_PER_LAP) / SECONDS_PER_LAP;

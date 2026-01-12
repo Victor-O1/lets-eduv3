@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import TimerCircle from "@/components/TimerCircle";
 import SubjectRow from "@/components/SubjectRow";
 import AddSubjectButton from "@/components/AddSubjectButton";
@@ -17,14 +17,25 @@ import {
   startFocus,
   stopFocus,
   tick,
+  endSegment,
+  setAccumulated,
+  setLastSubject,
 } from "@/store/slices/focusSlice";
 import { setSubjects, selectSubject } from "@/store/slices/subjectsSlice";
 
 import { Session, SessionInsert, Subject } from "@/lib/types";
 import { load, save } from "@/lib/storage";
 import SubjectDialog from "@/components/SubjectDialog";
-import { supabase } from "@/lib/supabase";
+import { getSupabaseClient } from "@/lib/supabase";
+const supabase = getSupabaseClient();
+
 import { formatHoursMinutes } from "@/lib/time";
+import {
+  fetchActiveSession,
+  fetchAndDeleteActiveSession,
+  getLocalUserId,
+  startActiveSession,
+} from "@/lib/db/activeSession";
 
 const SUBJECTS_KEY = "subjects";
 const ACTIVE_SESSION_KEY = "activeSession";
@@ -35,27 +46,138 @@ export default function FocusPage() {
   const [subjectDialogOpen, setSubjectDialogOpen] = useState(false);
   const [editingSubject, setEditingSubject] = useState<Subject | null>(null);
   const [todaySessions, setTodaySessions] = useState<Session[]>([]);
+  const [sessions, setSessions] = useState<Session[]>([]);
 
   const focus = useAppSelector((s) => s.focus);
   const subjects = useAppSelector((s) => s.subjects.list);
   const activeSubjectId = useAppSelector((s) => s.subjects.selectedSubjectId);
   const [timeView, setTimeView] = useState<"today" | "week">("today");
   const [stopping, setStopping] = useState(false);
+  const displaySeconds = focus.accumulatedSeconds + focus.elapsedSeconds;
+  const FOCUS_DRAFT_KEY = "focus_draft";
+  const isRunning = focus.status === "running";
+  const isPaused =
+    focus.status === "idle" &&
+    focus.accumulatedSeconds > 0 &&
+    !!focus.lastSubjectId;
+
   /* ---------------- INIT ---------------- */
 
+  //> Load active session
+  // useEffect(() => {
+  //   const storedSession = load<any | null>(ACTIVE_SESSION_KEY, null);
+
+  //   if (storedSession) {
+  //     const elapsedSinceStart = Math.floor(
+  //       (Date.now() - new Date(storedSession.startTime).getTime()) / 1000
+  //     );
+
+  //     dispatch(startFocus(storedSession));
+  //     dispatch(setElapsed(elapsedSinceStart));
+  //   }
+  // }, [dispatch]);
   useEffect(() => {
-    const storedSession = load<any | null>(ACTIVE_SESSION_KEY, null);
+    async function restoreSession() {
+      // 1️⃣ Fetch active session from DB
+      const dbSession = await fetchActiveSession(getLocalUserId());
 
-    if (storedSession) {
-      const elapsedSinceStart = Math.floor(
-        (Date.now() - new Date(storedSession.startTime).getTime()) / 1000
-      );
+      if (dbSession) {
+        const elapsed = Math.floor(
+          (Date.now() - new Date(dbSession.start_time).getTime()) / 1000
+        );
 
-      dispatch(startFocus(storedSession));
-      dispatch(setElapsed(elapsedSinceStart));
+        const session = {
+          sessionId: dbSession.id,
+          subjectId: dbSession.subject_id,
+          startTime: dbSession.start_time,
+        };
+
+        save(ACTIVE_SESSION_KEY, session);
+        dispatch(startFocus(session));
+        dispatch(setElapsed(elapsed));
+        return;
+      }
+
+      // 2️⃣ Fallback: localStorage only if DB empty
+      const stored = load<any | null>(ACTIVE_SESSION_KEY, null);
+      if (stored) {
+        const elapsed = Math.floor(
+          (Date.now() - new Date(stored.startTime).getTime()) / 1000
+        );
+        dispatch(startFocus(stored));
+        dispatch(setElapsed(elapsed));
+      }
     }
+
+    restoreSession();
   }, [dispatch]);
 
+  useEffect(() => {
+    async function restoreFocusState() {
+      // 1️⃣ Restore active DB session (highest priority)
+      const dbSession = await fetchActiveSession(getLocalUserId());
+
+      if (dbSession) {
+        const elapsed = Math.floor(
+          (Date.now() - new Date(dbSession.start_time).getTime()) / 1000
+        );
+
+        const session = {
+          sessionId: dbSession.id,
+          subjectId: dbSession.subject_id,
+          startTime: dbSession.start_time,
+        };
+
+        save(ACTIVE_SESSION_KEY, session);
+        dispatch(startFocus(session));
+        dispatch(setElapsed(elapsed));
+        return;
+      }
+
+      // 2️⃣ Restore paused draft (THIS FIXES YOUR BUG)
+      const draft = load<any | null>(FOCUS_DRAFT_KEY, null);
+      if (draft) {
+        dispatch(setAccumulated(draft.accumulatedSeconds));
+        dispatch(setLastSubject(draft.lastSubjectId));
+      }
+    }
+
+    restoreFocusState();
+  }, [dispatch]);
+
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      const dbSession = await fetchActiveSession(getLocalUserId());
+
+      // Case 1: DB says RUNNING, UI is idle → RESUME
+      if (dbSession && focus.status === "idle") {
+        const elapsed = Math.floor(
+          (Date.now() - new Date(dbSession.start_time).getTime()) / 1000
+        );
+
+        const session = {
+          sessionId: dbSession.id,
+          subjectId: dbSession.subject_id,
+          startTime: dbSession.start_time,
+        };
+
+        save(ACTIVE_SESSION_KEY, session);
+        dispatch(startFocus(session));
+        dispatch(setElapsed(elapsed));
+        return;
+      }
+
+      // Case 2: DB says STOPPED, UI is running → PAUSE
+      if (!dbSession && focus.status === "running") {
+        dispatch(endSegment());
+        localStorage.removeItem(ACTIVE_SESSION_KEY);
+      }
+    }, 5_000);
+
+    return () => clearInterval(interval);
+  }, [focus.status, dispatch]);
+
+  //> Load subjects
   useEffect(() => {
     async function syncFromDB() {
       try {
@@ -67,6 +189,7 @@ export default function FocusPage() {
         // 2. Update localStorage cache
         save(SUBJECTS_KEY, dbSubjects);
       } catch {
+        console.error("Failed to sync subjects from DB");
         // DB offline / error → silently fall back to cache
       }
     }
@@ -74,6 +197,7 @@ export default function FocusPage() {
     syncFromDB();
   }, [dispatch]);
 
+  //> Load today's sessions
   useEffect(() => {
     async function loadToday() {
       try {
@@ -85,6 +209,31 @@ export default function FocusPage() {
     loadToday();
   }, []);
 
+  //> Load all sessions of last 30 days
+  useEffect(() => {
+    async function loadSessions() {
+      try {
+        const supabase = getSupabaseClient();
+        if (!supabase) return;
+
+        const from = new Date();
+        from.setDate(from.getDate() - 30); // last 30 days
+
+        const { data, error } = await supabase
+          .from("sessions")
+          .select("*")
+          .gte("start_time", from.toISOString());
+
+        if (error) throw error;
+
+        setSessions(data ?? []);
+      } catch (e) {
+        console.error(e);
+      }
+    }
+
+    loadSessions();
+  }, []);
   /* ---------------- TIMER (THIS IS THE FIX) ---------------- */
 
   useEffect(() => {
@@ -99,83 +248,249 @@ export default function FocusPage() {
 
   /* ---------------- START / STOP ---------------- */
 
-  async function handleStartStop() {
-    if (focus.status === "running" && focus.activeSession) {
-      const now = new Date().toISOString();
+  // async function handleStartStop() {
+  //   if (focus.status === "running" && focus.activeSession) {
+  //     const now = new Date().toISOString();
 
-      const dbSession = {
-        user_id: "local-user", // until auth
-        subject_id: focus.activeSession.subjectId,
-        start_time: focus.activeSession.startTime,
+  //     const dbSession = {
+  //       user_id: "local-user", // until auth
+  //       subject_id: focus.activeSession.subjectId,
+  //       start_time: focus.activeSession.startTime,
+  //       end_time: now,
+  //       description: null,
+  //       is_interrupted: focus.isInterrupted,
+  //       created_at: now,
+  //     };
+
+  //     try {
+  //       await supabase.from("sessions").insert(dbSession);
+  //     } catch {
+  //       // optional: retry / queue offline later
+  //     }
+
+  //     localStorage.removeItem("activeSession");
+  //     dispatch(stopFocus());
+  //     return;
+  //   }
+
+  //   if (!activeSubjectId) return;
+
+  //   const session = {
+  //     sessionId: crypto.randomUUID(),
+  //     subjectId: activeSubjectId,
+  //     startTime: new Date().toISOString(),
+  //   };
+
+  //   save("activeSession", session);
+  //   dispatch(startFocus(session));
+  // }
+
+  /*----------------- Add Pause / Resume / Stop controls */
+  // function handlePauseResume() {
+  //   if (focus.status === "running") {
+  //     dispatch({ type: "focus/pause" }); // see note below
+  //   } else if (focus.status === "paused") {
+  //     dispatch({ type: "focus/resume" });
+  //   }
+  // }
+  // async function handlePause() {
+  //   // Pause = end current segment
+  //   dispatch({ type: "focus/pause" }); // see note below
+  //   await handleStop(); // reuse stop logic
+  // }
+
+  // async function handleResume() {
+  //   if (!focus.lastSubjectId) return;
+  //   dispatch({ type: "focus/resume" });
+  //   await handleSubjectClick(focus.lastSubjectId);
+  // }
+
+  // function computeElapsed(events: FocusEvent[]) {
+  // let elapsed = 0;
+  // let lastStart: Date | null = null;
+
+  // for (const e of events) {
+  //   if (e.type === "start" || e.type === "resume") {
+  //     lastStart = new Date(e.created_at);
+  //   }
+
+  //   if ((e.type === "pause" || e.type === "stop") && lastStart) {
+  //     elapsed +=
+  //       new Date(e.created_at).getTime() - lastStart.getTime();
+  //     lastStart = null;
+  //   }
+  // }
+
+  // if currently running
+  //   if (lastStart) {
+  //     elapsed += Date.now() - lastStart.getTime();
+  //   }
+
+  //   return Math.floor(elapsed / 1000);
+  // }
+
+  async function handlePause() {
+    const active = focus.activeSession;
+    if (!active) return;
+
+    const now = new Date().toISOString();
+
+    try {
+      await fetchAndDeleteActiveSession(getLocalUserId());
+
+      const payload: SessionInsert = {
+        user_id: null,
+        subject_id: active.subjectId,
+        start_time: active.startTime,
         end_time: now,
         description: null,
-        is_interrupted: focus.isInterrupted,
+        is_interrupted: false,
         created_at: now,
       };
 
-      try {
-        await supabase.from("sessions").insert(dbSession);
-      } catch {
-        // optional: retry / queue offline later
-      }
+      const inserted = await insertSession(payload);
+      setTodaySessions((prev) => [...prev, inserted]);
 
-      localStorage.removeItem("activeSession");
-      dispatch(stopFocus());
-      return;
+      // 🔥 Redux: move elapsed → accumulated
+      dispatch(endSegment());
+
+      // 🔥 NEW: persist UI continuity
+      save(FOCUS_DRAFT_KEY, {
+        accumulatedSeconds: focus.accumulatedSeconds + focus.elapsedSeconds,
+        lastSubjectId: active.subjectId,
+      });
+
+      localStorage.removeItem(ACTIVE_SESSION_KEY);
+    } catch (err) {
+      console.error("Pause failed", err);
     }
-
-    if (!activeSubjectId) return;
-
-    const session = {
-      sessionId: crypto.randomUUID(),
-      subjectId: activeSubjectId,
-      startTime: new Date().toISOString(),
-    };
-
-    save("activeSession", session);
-    dispatch(startFocus(session));
   }
 
-  /*----------------- Add Pause / Resume / Stop controls */
-  function handlePauseResume() {
-    if (focus.status === "running") {
-      dispatch({ type: "focus/pause" }); // see note below
-    } else if (focus.status === "paused") {
-      dispatch({ type: "focus/resume" });
+  async function handleResume() {
+    const subjectId = focus.lastSubjectId;
+    if (!subjectId) return;
+
+    try {
+      // 1️⃣ Start new DB active session
+      const dbSession = await startActiveSession(getLocalUserId(), subjectId);
+
+      if (!dbSession) return;
+
+      const session = {
+        sessionId: dbSession.id,
+        subjectId: dbSession.subject_id,
+        startTime: dbSession.start_time,
+      };
+
+      // 2️⃣ Mirror to localStorage
+      save(ACTIVE_SESSION_KEY, session);
+
+      // 3️⃣ Redux: start new segment (DO NOT reset accumulatedSeconds)
+      dispatch(startFocus(session));
+    } catch (err) {
+      console.error("Resume failed", err);
     }
   }
 
   /*----------------- Stop Timer --------------------*/
+  // async function handleStop() {
+  //   const active = focus.activeSession;
+  //   if (!active) return;
+
+  //   const now = new Date().toISOString();
+
+  //   const insertPayload: SessionInsert = {
+  //     user_id: null,
+  //     subject_id: active.subjectId,
+  //     start_time: active.startTime,
+  //     end_time: now,
+  //     description: null,
+  //     is_interrupted: focus.isInterrupted,
+  //     created_at: now,
+  //   };
+
+  //   let insertedSession: Session;
+
+  //   try {
+  //     insertedSession = await insertSession(insertPayload);
+  //   } catch (err) {
+  //     console.error("Session insert failed", err);
+  //     return;
+  //   }
+
+  //   // ✅ Now TypeScript is happy (has id)
+  //   setTodaySessions((prev) => [...prev, insertedSession]);
+
+  //   localStorage.removeItem(ACTIVE_SESSION_KEY);
+  //   dispatch(stopFocus());
+  // }
+
+  // async function handleStop() {
+  //   const active = focus.activeSession;
+  //   if (!active) return;
+
+  //   const now = new Date().toISOString();
+
+  //   try {
+  //     // 1️⃣ End active session (fetch + delete)
+  //     await fetchAndDeleteActiveSession(getLocalUserId());
+
+  //     // 2️⃣ Insert completed session
+  //     const insertPayload: SessionInsert = {
+  //       user_id: null, // until auth
+  //       subject_id: active.subjectId,
+  //       start_time: active.startTime,
+  //       end_time: now,
+  //       description: null,
+  //       // is_interrupted: focus.isInterrupted,
+  //       created_at: now,
+  //     };
+
+  //     const insertedSession = await insertSession(insertPayload);
+
+  //     setTodaySessions((prev) => [...prev, insertedSession]);
+
+  //     // 3️⃣ Cleanup UI state
+  //     localStorage.removeItem(ACTIVE_SESSION_KEY);
+  //     dispatch(stopFocus());
+  //   } catch (err) {
+  //     console.error("Stop failed", err);
+  //   }
+  // }
   async function handleStop() {
     const active = focus.activeSession;
     if (!active) return;
 
     const now = new Date().toISOString();
 
-    const insertPayload: SessionInsert = {
-      user_id: null,
-      subject_id: active.subjectId,
-      start_time: active.startTime,
-      end_time: now,
-      description: null,
-      is_interrupted: focus.isInterrupted,
-      created_at: now,
-    };
-
-    let insertedSession: Session;
-
     try {
-      insertedSession = await insertSession(insertPayload);
+      // 1️⃣ End active DB session (authoritative)
+      await fetchAndDeleteActiveSession(getLocalUserId());
+
+      // 2️⃣ Insert completed session (segment)
+      const insertPayload: SessionInsert = {
+        user_id: null, // until auth
+        subject_id: active.subjectId,
+        start_time: active.startTime,
+        end_time: now,
+        description: null,
+        is_interrupted: false, // stop = intentional end
+        created_at: now,
+      };
+
+      const insertedSession = await insertSession(insertPayload);
+
+      // 3️⃣ Update in-memory analytics
+      setTodaySessions((prev) => [...prev, insertedSession]);
+
+      // 4️⃣ Cleanup local cache
+      localStorage.removeItem(ACTIVE_SESSION_KEY);
+
+      // 5️⃣ Redux: HARD reset (differs from pause)
+      dispatch(stopFocus());
     } catch (err) {
-      console.error("Session insert failed", err);
-      return;
+      console.error("Stop failed", err);
     }
-
-    // ✅ Now TypeScript is happy (has id)
-    setTodaySessions((prev) => [...prev, insertedSession]);
-
-    localStorage.removeItem(ACTIVE_SESSION_KEY);
-    dispatch(stopFocus());
   }
 
   /* ---------------- DELETE SUBJECT ---------------- */
@@ -263,20 +578,43 @@ export default function FocusPage() {
   }
 
   /* ---------------- HANDLE SUBJECT CLICK ---------------- */
-  function handleSubjectClick(subjectId: string) {
-    // If already running or paused, ignore for now
+  // > Clicking a subject starts a new session
+  // function handleSubjectClick(subjectId: string) {
+  //   // If already running or paused, ignore for now
+  //   if (focus.status !== "idle") return;
+
+  //   dispatch(selectSubject(subjectId));
+
+  //   const session = {
+  //     sessionId: crypto.randomUUID(),
+  //     subjectId,
+  //     startTime: new Date().toISOString(),
+  //   };
+
+  //   save("activeSession", session);
+  //   dispatch(startFocus(session));
+  // }
+  async function handleSubjectClick(subjectId: string) {
     if (focus.status !== "idle") return;
 
-    dispatch(selectSubject(subjectId));
+    try {
+      const dbSession = await startActiveSession(getLocalUserId(), subjectId);
 
-    const session = {
-      sessionId: crypto.randomUUID(),
-      subjectId,
-      startTime: new Date().toISOString(),
-    };
+      if (!dbSession) return;
 
-    save("activeSession", session);
-    dispatch(startFocus(session));
+      const session = {
+        sessionId: dbSession.id,
+        subjectId: dbSession.subject_id,
+        startTime: dbSession.start_time,
+      };
+
+      save(ACTIVE_SESSION_KEY, session);
+      dispatch(selectSubject(subjectId));
+      dispatch(startFocus(session));
+      dispatch(setElapsed(0));
+    } catch (err) {
+      console.error("Failed to start session", err);
+    }
   }
 
   /**************** Compute subject-wise minutes ************** */
@@ -318,7 +656,6 @@ export default function FocusPage() {
   }
 
   function getTotalSecondsForView() {
-    const now = new Date();
     let from: Date;
 
     if (timeView === "today") {
@@ -332,17 +669,16 @@ export default function FocusPage() {
 
     let seconds = 0;
 
-    // 1️⃣ DB sessions
-    for (const s of todaySessions) {
+    // DB sessions (correct dataset now)
+    for (const s of sessions) {
       const start = new Date(s.start_time);
       if (start < from) continue;
 
       const end = s.end_time ? new Date(s.end_time) : new Date();
-
       seconds += Math.floor((end.getTime() - start.getTime()) / 1000);
     }
 
-    // 2️⃣ Live active session (if in range)
+    // Live session
     if (focus.activeSession && focus.status === "running") {
       const start = new Date(focus.activeSession.startTime);
       if (start >= from) {
@@ -352,7 +688,12 @@ export default function FocusPage() {
 
     return seconds;
   }
-  const totalSecondsForView = getTotalSecondsForView();
+
+  // const totalSecondsForView = getTotalSecondsForView();
+  const totalSecondsForView = useMemo(
+    () => getTotalSecondsForView(),
+    [sessions, focus.elapsedSeconds, focus.status, timeView]
+  );
   const totalLabel = formatHoursMinutes(totalSecondsForView);
 
   /**************** Build heatmap ************** */
@@ -386,9 +727,45 @@ export default function FocusPage() {
       {/* TIMER */}
       <div className="flex flex-col items-center relative z-10 mx-auto md:mx-0">
         <div className="backdrop-blur-xl bg-white/5 rounded-3xl p-8 md:p-12 border border-white/10 shadow-2xl hover:bg-white/[0.07] transition-all duration-500">
-          <TimerCircle elapsed={focus.elapsedSeconds} />
+          <TimerCircle elapsed={displaySeconds} />
         </div>
-        {focus.status !== "idle" && (
+        {isRunning && (
+          <div className="mt-8 flex gap-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
+            <button
+              onClick={handlePause}
+              className="group px-8 py-3.5 rounded-xl bg-gradient-to-r from-slate-700/80 to-slate-600/80 backdrop-blur-sm border border-white/10 hover:border-white/20 transition-all duration-300 hover:scale-105 hover:shadow-lg hover:shadow-slate-500/20 font-medium"
+            >
+              ⏸ Pause
+            </button>
+
+            <button
+              onClick={handleStop}
+              className="group px-8 py-3.5 rounded-xl bg-gradient-to-r from-red-600/80 to-red-500/80 backdrop-blur-sm border border-red-400/20 hover:border-red-400/40 transition-all duration-300 hover:scale-105 hover:shadow-lg hover:shadow-red-500/30 font-medium"
+            >
+              ⏹ Stop
+            </button>
+          </div>
+        )}
+
+        {!isRunning && isPaused && (
+          <div className="mt-8 flex gap-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
+            <button
+              onClick={handleResume}
+              className="group px-8 py-3.5 rounded-xl bg-gradient-to-r from-emerald-600/80 to-emerald-500/80 backdrop-blur-sm border border-emerald-400/20 hover:border-emerald-400/40 transition-all duration-300 hover:scale-105 hover:shadow-lg hover:shadow-emerald-500/30 font-medium"
+            >
+              ▶ Resume
+            </button>
+
+            <button
+              onClick={handleStop}
+              className="group px-8 py-3.5 rounded-xl bg-gradient-to-r from-red-600/80 to-red-500/80 backdrop-blur-sm border border-red-400/20 hover:border-red-400/40 transition-all duration-300 hover:scale-105 hover:shadow-lg hover:shadow-red-500/30 font-medium"
+            >
+              ⏹ Stop
+            </button>
+          </div>
+        )}
+
+        {/* {focus.status !== "idle" && (
           <div className="mt-8 flex gap-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
             <button
               onClick={handlePauseResume}
@@ -405,7 +782,7 @@ export default function FocusPage() {
               <span className="flex items-center gap-2">⏹ Stop</span>
             </button>
           </div>
-        )}
+        )} */}
       </div>
 
       {/* SUBJECT LIST */}

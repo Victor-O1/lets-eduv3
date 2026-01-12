@@ -1,5 +1,7 @@
-import { supabase } from "@/lib/supabase";
+import { getSupabaseClient } from "@/lib/supabase";
+
 import { Session, SessionInsert } from "@/lib/types";
+const supabase = getSupabaseClient();
 
 export async function insertSession(session: SessionInsert) {
   const { data, error } = await supabase

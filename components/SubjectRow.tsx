@@ -77,6 +77,9 @@ export default function SubjectRow({
             <DropdownMenuItem onClick={() => onEdit?.(subject)}>
               Edit
             </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => onEdit?.(subject)}>
+              Add missed sessions
+            </DropdownMenuItem>
 
             {/* DELETE WITH CONFIRM */}
             <AlertDialog>

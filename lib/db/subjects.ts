@@ -1,5 +1,7 @@
-import { supabase } from "@/lib/supabase";
+import { getSupabaseClient } from "@/lib/supabase";
+
 import { Subject } from "@/lib/types";
+const supabase = getSupabaseClient();
 
 export async function fetchSubjectsFromDB() {
   const { data, error } = await supabase
