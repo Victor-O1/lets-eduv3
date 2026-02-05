@@ -1,6 +1,6 @@
-# StudyHub – Full-Stack Study & Productivity Platform
+# NixLearn – Full-Stack Study & Productivity Platform
 
-StudyHub is a full-stack web application designed to help students **track focus time**, **organize notes**, and **analyze productivity trends** using real-time data and interactive analytics.
+NixLearn is a full-stack web application designed to help students **track focus time**, **organize notes**, and **analyze productivity trends** using real-time data and interactive analytics.
 
 It combines a smart focus timer, subject-based note management, and rich visual dashboards — all secured with authentication and backed by a real database.
 
@@ -112,7 +112,7 @@ Derived state is computed client-side from immutable event logs.
 
 ```bash
 git clone <repo-url>
-cd studyhub
+cd nixlearn
 npm install
 npm run dev
 ```
